@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use ncurses::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use chrono::Utc;
 
 const ROOT: &str = "/home/pdc/dev";
 const CONFIG_NAME: &str = "fylex.config.json";
@@ -319,6 +320,9 @@ fn open_in_terminal(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // Clear screen before handing off to the shell (exec never returns on success)
+        print!("\x1B[2J\x1B[H");
+        let _ = std::io::stdout().flush();
         let err = Command::new(&shell).current_dir(path).exec();
         // If exec returns, it failed
         Err(anyhow::anyhow!(format!("exec failed: {err}")))
@@ -344,8 +348,79 @@ fn flash_line(msg: &str, color_pair: i16) {
     refresh();
     napms(1500);
 }
+
 fn flash_error(msg: &str) {
     flash_line(msg, 5);
+}
+
+fn flash_ok(msg: &str) {
+    flash_line(msg, 4);
+}
+
+fn prompt_input(label: &str, initial: &str) -> String {
+    let mut rows = 0;
+    let mut cols = 0;
+    getmaxyx(stdscr(), &mut rows, &mut cols);
+
+    let mut buf = initial.to_string();
+    loop {
+        attron(COLOR_PAIR(3));
+        mvhline(rows - 1, 0, ' ' as u32, cols);
+        let _ = mvprintw(rows - 1, 1, label);
+        attroff(COLOR_PAIR(3));
+        let _ = mvprintw(rows - 1, (label.len() + 1) as i32, &buf);
+        mv(rows - 1, (label.len() + 2 + buf.len()) as i32);
+        refresh();
+        let ch = getch();
+        match ch {
+            10 => break,
+            27 => { buf.clear(); break; }, // ESC to cancel
+            127 | KEY_BACKSPACE => { buf.pop(); },
+            c if (32..=126).contains(&c) => buf.push(c as u8 as char),
+            _ => {}
+
+        }
+    }
+    buf
+
+}
+
+fn create_new_project(root: &str, name: &str) -> Result<()> {
+    let dir = Path::new(root).join(name);
+    if dir.exists() {
+        return Err(anyhow::anyhow!("Directory already exists"));
+    }
+    let _ = fs::create_dir_all(&dir);
+    // Adicionar git init
+    Command::new("git")
+        .arg("init")
+        .arg(&dir)
+        .output()
+        .with_context(|| "Failed to initialize git repository")?;
+    write_default_config(&dir)
+}
+
+fn write_default_config(dir: &Path) -> Result<()> {
+    let name = Path::new(dir)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let cfg = ProjectConfig {
+        name,
+        description: String::new(), 
+        tags: Vec::new(),
+        created_at: Utc::now().to_rfc3339(),
+    };
+
+    write_config(dir, &cfg)
+}
+
+fn write_config(dir: &Path, cfg: &ProjectConfig) -> Result<()> {
+    let p = dir.join(CONFIG_NAME);
+    let s = serde_json::to_string_pretty(cfg)?;
+    fs::write(p, s)?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -378,10 +453,6 @@ fn main() -> Result<()> {
         match ch {
             81 => break,
             // Allow filter text input
-            c if (32..=126).contains(&c) => {
-                state.filter_text.push(c as u8 as char);
-                rebuild_filter(&mut state);
-            }
             // Backspace
             127 | KEY_BACKSPACE => {
                 state.filter_text.pop();
@@ -407,6 +478,26 @@ fn main() -> Result<()> {
                         Err(e) => flash_error(&format!("Terminal open failed: {e}")),
                     }
                 }
+            }
+            // N for create new project folder
+            78 => {
+                let name = prompt_input("New project name: ","");
+                if name.trim().is_empty() {
+                    flash_error("Name cannot be empty");
+                } else {
+                    match create_new_project(ROOT, name.trim()) {
+                        Ok(_) => {
+                            flash_ok("Project created");
+                            state.projects = scan_projects(ROOT)?;
+                            rebuild_filter(&mut state);
+                        }
+                        _ => flash_error("Failed to create project"),
+                    }
+                }
+            }
+            c if (32..=126).contains(&c) => {
+                state.filter_text.push(c as u8 as char);
+                rebuild_filter(&mut state);
             }
             _ => {}
         }
